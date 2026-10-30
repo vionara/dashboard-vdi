@@ -12,6 +12,24 @@ load_dotenv()
 st.set_page_config(page_title="Dashboard Populasi & Ekonomi", page_icon="🌍", layout="wide")
 
 DB_PATH = os.getenv("SQLITE_PATH", "database/world_data.db")
+
+# ==================== LOGIKA OTOMATIS PEMBUATAN DATABASE ====================
+# Jika file database belum ada di server deploy, buat otomatis dari CSV atau seeder
+CSV_PATH = "database/data_populasi_ekonomi.csv"
+
+if not os.path.exists(DB_PATH):
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    if os.path.exists(CSV_PATH):
+        raw_df = pd.read_csv(CSV_PATH)
+        temp_engine = create_engine(f"sqlite:///{DB_PATH}")
+        cols = ["country_code", "country_name", "year", "population", "gdp_per_capita"]
+        available_cols = [c for c in cols if c in raw_df.columns]
+        raw_df[available_cols].to_sql("indicators", temp_engine, if_exists="replace", index=False)
+    elif os.path.exists("database/seed_data.py"):
+        import runpy
+        runpy.run_path("database/seed_data.py")
+# ============================================================================
+
 MONGO_URI = os.getenv("MONGO_URI", "")
 MONGO_DB = os.getenv("MONGO_DB", "vdi_dashboard")
 
