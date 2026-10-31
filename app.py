@@ -1,20 +1,20 @@
 import os
-from datetime import datetime, timezone
 import io
+import sqlite3
+from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from sqlalchemy import create_engine, text
 
 load_dotenv()
 st.set_page_config(page_title="Dashboard Populasi & Ekonomi", page_icon="🌍", layout="wide")
 
-DB_PATH = os.getenv("SQLITE_PATH", "database/world_data.db")
+DB_FILE = "world_data.db"
 
-# ==================== DATA OTOMATIS ====================
+# Dataset tertanam langsung
 EMBEDDED_CSV = """country_code,country_name,year,population,gdp_per_capita,region,income_group
 IDN,Indonesia,2010,246305322.0,3065.68,Asia Tenggara,Menengah
 MYS,Malaysia,2010,28655776.0,8899.35,Asia Tenggara,Menengah
@@ -88,41 +88,42 @@ THA,Thailand,2023,72280000.0,7171.75,Asia Tenggara,Menengah
 USA,United States,2023,334914895.0,81695.19,Amerika Utara,Tinggi
 """
 
-# Bikin database SQLite otomatis saat itu juga
-os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
-if not os.path.exists(DB_PATH):
-    engine_init = create_engine(f"sqlite:///{DB_PATH}")
-    df_raw = pd.read_csv(io.StringIO(EMBEDDED_CSV.strip()))
+# Buat database SQLite jika belum ada
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    df_seed = pd.read_csv(io.StringIO(EMBEDDED_CSV.strip()))
     cols = ["country_code", "country_name", "year", "population", "gdp_per_capita"]
-    df_raw[cols].to_sql("indicators", engine_init, if_exists="replace", index=False)
+    df_seed[cols].to_sql("indicators", conn, if_exists="replace", index=False)
+    conn.close()
+
+if not os.path.exists(DB_FILE):
+    init_db()
 
 MONGO_URI = os.getenv("MONGO_URI", "")
 MONGO_DB = os.getenv("MONGO_DB", "vdi_dashboard")
 
-@st.cache_resource
-def get_sql_engine():
-    return create_engine(f"sqlite:///{DB_PATH}")
-
-@st.cache_resource
 def get_mongo_collection():
     if not MONGO_URI:
         return None
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
-    client.admin.command("ping")
-    return client[MONGO_DB]
+    try:
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+        client.admin.command("ping")
+        return client[MONGO_DB]
+    except Exception:
+        return None
 
 def load_data():
-    engine = get_sql_engine()
-    with engine.connect() as conn:
-        data = pd.read_sql(text("""
-            SELECT country_code, country_name, year, population, gdp_per_capita
-            FROM indicators
-            ORDER BY year
-        """), conn)
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        data = pd.read_sql("SELECT country_code, country_name, year, population, gdp_per_capita FROM indicators ORDER BY year", conn)
+    except Exception:
+        init_db()
+        data = pd.read_sql("SELECT country_code, country_name, year, population, gdp_per_capita FROM indicators ORDER BY year", conn)
+    finally:
+        conn.close()
 
     db = get_mongo_collection()
     if db is None:
-        # Fallback metadata jika tanpa MongoDB
         metadata_dict = {
             "IDN": ("Asia Tenggara", "Menengah"),
             "MYS": ("Asia Tenggara", "Menengah"),
@@ -133,21 +134,23 @@ def load_data():
         data["region"] = data["country_code"].map(lambda x: metadata_dict.get(x, ("Lainnya", ""))[0])
         data["income_group"] = data["country_code"].map(lambda x: metadata_dict.get(x, ("", "Tidak tersedia"))[1])
     else:
-        metadata = list(db["country_metadata"].find(
-            {}, {"_id": 0, "country_code": 1, "region": 1, "income_group": 1}
-        ))
-        if not metadata:
-            defaults = [
-                {"country_code":"IDN","region":"Asia Tenggara","income_group":"Menengah"},
-                {"country_code":"MYS","region":"Asia Tenggara","income_group":"Menengah"},
-                {"country_code":"SGP","region":"Asia Tenggara","income_group":"Tinggi"},
-                {"country_code":"THA","region":"Asia Tenggara","income_group":"Menengah"},
-                {"country_code":"USA","region":"Amerika Utara","income_group":"Tinggi"},
-            ]
-            db["country_metadata"].insert_many(defaults)
-            metadata = defaults
-        metadata_df = pd.DataFrame(metadata)
-        data = data.merge(metadata_df, on="country_code", how="left")
+        try:
+            metadata = list(db["country_metadata"].find({}, {"_id": 0, "country_code": 1, "region": 1, "income_group": 1}))
+            if not metadata:
+                defaults = [
+                    {"country_code":"IDN","region":"Asia Tenggara","income_group":"Menengah"},
+                    {"country_code":"MYS","region":"Asia Tenggara","income_group":"Menengah"},
+                    {"country_code":"SGP","region":"Asia Tenggara","income_group":"Tinggi"},
+                    {"country_code":"THA","region":"Asia Tenggara","income_group":"Menengah"},
+                    {"country_code":"USA","region":"Amerika Utara","income_group":"Tinggi"},
+                ]
+                db["country_metadata"].insert_many(defaults)
+                metadata = defaults
+            metadata_df = pd.DataFrame(metadata)
+            data = data.merge(metadata_df, on="country_code", how="left")
+        except Exception:
+            data["region"] = "Asia"
+            data["income_group"] = "Menengah"
     return data
 
 def save_activity(action, details):
@@ -159,22 +162,13 @@ def save_activity(action, details):
                 "details": details,
                 "created_at": datetime.now(timezone.utc)
             })
-    except Exception as exc:
+    except Exception:
         pass
 
 st.title("🌍 Dashboard Analisis Populasi dan Ekonomi Dunia")
 st.caption("Integrasi SQLite + MongoDB | Python, Pandas, Plotly, dan Streamlit")
 
-try:
-    df = load_data()
-except Exception as exc:
-    st.error("Gagal membaca database.")
-    st.exception(exc)
-    st.stop()
-
-if df.empty:
-    st.warning("Belum ada data.")
-    st.stop()
+df = load_data()
 
 st.sidebar.header("Filter Dashboard")
 country_options = sorted(df["country_name"].dropna().unique().tolist())
